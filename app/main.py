@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from . import config
 from .errors import JobError, ScriptRejected, ValidationError
 from .jobs import registry
+from .merge_service import run_merge_pipeline
 from .samples import ensure_samples
 from .service import run_pipeline
 
@@ -51,6 +52,17 @@ def list_samples() -> JSONResponse:
     return JSONResponse(ensure_samples(STATIC_DIR))
 
 
+def _validate_upload_bytes(raw: bytes, label: str) -> None:
+    if len(raw) == 0:
+        raise ValidationError(f"{label}文件为空。")
+    if len(raw) > config.MAX_DB_BYTES:
+        raise ValidationError(
+            f"{label}大小 {len(raw)} 字节，超过上限 {config.MAX_DB_BYTES} 字节。"
+        )
+    if not raw.startswith(b"SQLite format 3\x00"):
+        raise ValidationError(f"{label}不是合法的 SQLite 数据库（魔数校验失败）。")
+
+
 @app.post("/api/jobs")
 async def create_job(
     db: UploadFile = File(..., description="满足约束的 SQLite 数据库"),
@@ -58,14 +70,7 @@ async def create_job(
     script_text: str = Form("", description="或直接粘贴 SQL 脚本"),
 ) -> JSONResponse:
     raw_db = await db.read()
-    if len(raw_db) == 0:
-        raise ValidationError("数据库文件为空。")
-    if len(raw_db) > config.MAX_DB_BYTES:
-        raise ValidationError(
-            f"数据库大小 {len(raw_db)} 字节，超过上限 {config.MAX_DB_BYTES} 字节。"
-        )
-    if not raw_db.startswith(b"SQLite format 3\x00"):
-        raise ValidationError("文件不是合法的 SQLite 数据库（魔数校验失败）。")
+    _validate_upload_bytes(raw_db, "数据库")
 
     if sql is not None:
         raw_script = await sql.read()
@@ -81,6 +86,42 @@ async def create_job(
     Path(upload_path).chmod(0o444)
 
     registry.run_in_background(job, run_pipeline, str(upload_path), raw_script)
+    return JSONResponse({"id": job.id, "status": job.status}, status_code=202)
+
+
+@app.post("/api/merge-jobs")
+async def create_merge_job(
+    base_db: UploadFile = File(..., description="基准库（共同祖先）"),
+    revision_db: UploadFile = File(..., description="修订库（开发者修正）"),
+    current_db: UploadFile = File(..., description="当前库（含新补录）"),
+) -> JSONResponse:
+    uploads = (
+        ("base", base_db, "基准库"),
+        ("revision", revision_db, "修订库"),
+        ("current", current_db, "当前库"),
+    )
+    raw_files: dict[str, bytes] = {}
+    for key, upload, label in uploads:
+        raw = await upload.read()
+        _validate_upload_bytes(raw, label)
+        raw_files[key] = raw
+
+    job = registry.create()
+    saved_paths: dict[str, str] = {}
+    for key, raw in raw_files.items():
+        path = job.dir / f"upload_{key}.db"
+        path.write_bytes(raw)
+        # 三个上传原件全部只读保存，合并只接触规范副本
+        path.chmod(0o444)
+        saved_paths[key] = str(path)
+
+    registry.run_in_background(
+        job,
+        run_merge_pipeline,
+        saved_paths["base"],
+        saved_paths["revision"],
+        saved_paths["current"],
+    )
     return JSONResponse({"id": job.id, "status": job.status}, status_code=202)
 
 
@@ -102,6 +143,23 @@ def download_reduced(job_id: str) -> FileResponse:
         reduced,
         media_type="application/x-sqlite3",
         filename="repro.db",
+    )
+
+
+@app.get("/api/merge-jobs/{job_id}/download")
+def download_merged(job_id: str) -> FileResponse:
+    job = registry.get(job_id)
+    if job.result.get("kind") != "merge":
+        raise JobError("该任务不是三方合并任务。")
+    if job.status != "done" or not job.result.get("download_available"):
+        raise JobError("合并结果尚不可下载（存在冲突或外键失效）。")
+    merged = job.dir / "merged.db"
+    if not merged.exists():
+        raise JobError("合并库文件已被清理。")
+    return FileResponse(
+        merged,
+        media_type="application/x-sqlite3",
+        filename="merged.db",
     )
 
 

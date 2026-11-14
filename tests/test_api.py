@@ -5,22 +5,8 @@ import os
 import sqlite3
 import time
 
-import pytest
-
-# 每个测试进程使用独立 DATA_DIR
+# 每个测试进程使用独立 DATA_DIR（conftest.py 也会设置，保持本文件可独立运行）
 os.environ.setdefault("DATA_DIR", "/tmp/reducer-test-data")
-
-from fastapi.testclient import TestClient  # noqa: E402
-
-from app.config import DATA_DIR  # noqa: E402
-from app.main import app  # noqa: E402
-
-
-@pytest.fixture()
-def client():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with TestClient(app) as c:
-        yield c
 
 
 def _wait_done(client, job_id, timeout=60):
@@ -42,10 +28,15 @@ def test_index_and_samples(client):
     r = client.get("/api/samples")
     assert r.status_code == 200
     samples = r.json()
-    assert set(samples) == {"cyclic", "commit_then_fail"}
-    for info in samples.values():
+    assert {"cyclic", "commit_then_fail", "merge_samples"} <= set(samples)
+    for key, info in samples.items():
+        if key == "merge_samples":
+            continue
         assert client.get(info["db_url"]).status_code == 200
         assert client.get(info["sql_url"]).status_code == 200
+    for info in samples["merge_samples"].values():
+        for role in ("base_url", "revision_url", "current_url"):
+            assert client.get(info[role]).status_code == 200
 
 
 def test_full_job_cyclic_sample(client):

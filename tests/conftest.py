@@ -1,9 +1,25 @@
 """pytest 共享夹具。"""
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import pytest
+
+# 每个测试进程使用独立 DATA_DIR（必须在导入 app.config 前设置）
+os.environ.setdefault("DATA_DIR", "/tmp/reducer-test-data")
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+from app.config import DATA_DIR  # noqa: E402
+from app.main import app  # noqa: E402
+
+
+@pytest.fixture()
+def client():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with TestClient(app) as c:
+        yield c
 
 
 @pytest.fixture()

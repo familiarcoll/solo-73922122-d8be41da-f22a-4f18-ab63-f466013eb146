@@ -46,6 +46,16 @@
   a.dl { display: inline-block; margin-top: 12px; background: var(--green);
          color: #fff; text-decoration: none; padding: 9px 22px; border-radius: 6px; }
   .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .kind-tag { display: inline-block; padding: 1px 8px; border-radius: 4px;
+              font-size: 12px; font-weight: 600; }
+  .kind-insert { background: #dafbe1; color: var(--green); }
+  .kind-update { background: #ddf4ff; color: var(--blue); }
+  .kind-delete { background: #ffebe9; color: var(--red); }
+  .conflict-row { background: #fff1e5; }
+  .violation-row { background: #ffebe9; }
+  .merge-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .merge-grid label { margin-top: 8px; }
+  @media (max-width: 720px) { .merge-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -92,6 +102,56 @@
     <p id="job-message"></p>
     <div id="job-detail"></div>
   </section>
+
+  <section class="card constraints" style="margin-top:28px">
+    <h2>三方合并规则</h2>
+    <ul>
+      <li>三个库结构必须相同：同样的表、列、单列 INTEGER 主键与外键，且各自外键有效、
+          至多 3 表共 60 行，<b>允许循环外键</b>。</li>
+      <li>按表和主键找出<b>基准库 → 修订库</b>的增 / 删 / 改，只把这些变更应用到
+          当前库副本；当前库的其它补录原样保留。</li>
+      <li>当前库对同一行也有不兼容变更时报告<b>冲突</b>；即使没有同行冲突，
+          合并后外键失效也会指出涉及的行。两种情况都<b>不提供部分结果</b>，上传文件保持原样。</li>
+      <li>成功时可下载外键有效的合并库 <code>merged.db</code>。</li>
+    </ul>
+  </section>
+
+  <section class="card samples">
+    <h2>合并样例</h2>
+    <div id="merge-sample-buttons"></div>
+    <div class="hint">可分别下载基准 / 修订 / 当前三个库，或点击“直接试跑”自动上传并合并。</div>
+  </section>
+
+  <section class="card">
+    <h2>三方合并</h2>
+    <form id="merge-form">
+      <div class="merge-grid">
+        <div>
+          <label for="merge-base">基准库（共同祖先）</label>
+          <input id="merge-base" name="base_db" type="file"
+                 accept=".db,.sqlite,.sqlite3,application/x-sqlite3" required>
+        </div>
+        <div>
+          <label for="merge-revision">修订库（开发者修正）</label>
+          <input id="merge-revision" name="revision_db" type="file"
+                 accept=".db,.sqlite,.sqlite3,application/x-sqlite3" required>
+        </div>
+        <div>
+          <label for="merge-current">当前库（含新补录）</label>
+          <input id="merge-current" name="current_db" type="file"
+                 accept=".db,.sqlite,.sqlite3,application/x-sqlite3" required>
+        </div>
+      </div>
+      <div><button id="merge-submit-btn" type="submit">开始三方合并</button></div>
+    </form>
+  </section>
+
+  <section class="card status" id="merge-panel">
+    <h2>合并任务 <span id="merge-job-id" class="pill"></span>
+        <span id="merge-job-status" class="pill"></span></h2>
+    <p id="merge-job-message"></p>
+    <div id="merge-detail"></div>
+  </section>
 </main>
 
 <script>
@@ -108,6 +168,7 @@ async function loadSamples() {
   const data = await r.json();
   const box = $('sample-buttons');
   for (const [key, info] of Object.entries(data)) {
+    if (key === 'merge_samples') continue;
     box.insertAdjacentHTML('beforeend',
       `<div style="margin:8px 0"><b>${esc(info.title)}</b><br>
        <a class="dl" style="background:#57606a" href="${info.db_url}" download>下载样例库</a>
@@ -116,6 +177,34 @@ async function loadSamples() {
   }
   box.querySelectorAll('button[data-sample]').forEach((btn) =>
     btn.addEventListener('click', () => runSample(btn.dataset.sample)));
+
+  const mbox = $('merge-sample-buttons');
+  const mergeSamples = data.merge_samples || {};
+  for (const [key, info] of Object.entries(mergeSamples)) {
+    mbox.insertAdjacentHTML('beforeend',
+      `<div style="margin:8px 0"><b>${esc(info.title)}</b><br>
+       <a class="dl" style="background:#57606a" href="${info.base_url}" download>下载基准库</a>
+       <a class="dl" style="background:#57606a" href="${info.revision_url}" download>下载修订库</a>
+       <a class="dl" style="background:#57606a" href="${info.current_url}" download>下载当前库</a>
+       <button class="secondary" type="button" data-merge-sample="${key}">直接试跑</button></div>`);
+  }
+  mbox.querySelectorAll('button[data-merge-sample]').forEach((btn) =>
+    btn.addEventListener('click', () => runMergeSample(btn.dataset.mergeSample)));
+}
+
+async function runMergeSample(key) {
+  const r = await fetch('/api/samples');
+  const data = await r.json();
+  const info = data.merge_samples[key];
+  const roles = [['base_db', info.base_url, 'sample_merge_base.db'],
+                 ['revision_db', info.revision_url, 'sample_merge_revision.db'],
+                 ['current_db', info.current_url, 'sample_merge_current.db']];
+  const form = new FormData();
+  for (const [field, url, name] of roles) {
+    const resp = await fetch(url);
+    form.append(field, new File([await resp.blob()], name));
+  }
+  submitMergeForm(form);
 }
 
 async function runSample(key) {
@@ -242,6 +331,160 @@ function finish(id, job) {
 }
 
 loadSamples();
+
+// ============================ 三方合并 ============================
+let mergePollTimer = null;
+
+$('merge-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const form = new FormData();
+  const base = $('merge-base').files[0];
+  const revision = $('merge-revision').files[0];
+  const current = $('merge-current').files[0];
+  if (!base || !revision || !current) { alert('请同时选择基准库、修订库和当前库'); return; }
+  form.append('base_db', base);
+  form.append('revision_db', revision);
+  form.append('current_db', current);
+  submitMergeForm(form);
+});
+
+async function submitMergeForm(form) {
+  $('merge-submit-btn').disabled = true;
+  $('merge-panel').classList.add('active');
+  setMergeStatus('running', '已上传，等待处理…');
+  $('merge-detail').innerHTML = '';
+  try {
+    const r = await fetch('/api/merge-jobs', { method: 'POST', body: form });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || `HTTP ${r.status}`);
+    $('merge-job-id').textContent = data.id.slice(0, 8);
+    pollMergeJob(data.id);
+  } catch (err) {
+    setMergeStatus('error', '');
+    $('merge-job-message').innerHTML = `<span class="err">${esc(err.message)}</span>`;
+    $('merge-submit-btn').disabled = false;
+  }
+}
+
+function setMergeStatus(status, message) {
+  const el = $('merge-job-status');
+  el.className = `pill ${status}`;
+  el.textContent = { queued: '排队中', running: '运行中', done: '完成',
+                     error: '失败' }[status] || status;
+  if (message) $('merge-job-message').textContent = message;
+}
+
+function pollMergeJob(id) {
+  clearInterval(mergePollTimer);
+  mergePollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`/api/jobs/${id}`);
+      const job = await r.json();
+      if (!r.ok) throw new Error(job.detail || `HTTP ${r.status}`);
+      setMergeStatus(job.status, job.message);
+      if (job.status === 'done') {
+        renderMergeResult(id, job);
+        clearInterval(mergePollTimer);
+        $('merge-submit-btn').disabled = false;
+      }
+      if (job.status === 'error') {
+        $('merge-job-message').innerHTML = `<span class="err">${esc(job.message)}</span>`;
+        clearInterval(mergePollTimer);
+        $('merge-submit-btn').disabled = false;
+      }
+    } catch (err) {
+      clearInterval(mergePollTimer);
+      setMergeStatus('error', '');
+      $('merge-job-message').innerHTML = `<span class="err">${esc(err.message)}</span>`;
+      $('merge-submit-btn').disabled = false;
+    }
+  }, 1000);
+}
+
+function rowCells(columns, values) {
+  if (values == null) return '<td colspan="' + columns.length + '" class="hint">（不存在）</td>';
+  return values.map((v) => `<td>${v === null ? '<i>NULL</i>' : esc(String(v))}</td>`).join('');
+}
+
+function renderRowTable(title, rows, columnsKey, badge) {
+  if (!rows || !rows.length) return '';
+  const cols = rows[0].columns;
+  let html = `<details open><summary>${title}（${rows.length}）</summary>
+    <table><tr><th>表</th><th>主键</th>${badge ? '<th>类型</th>' : ''}`;
+  for (const c of cols) html += `<th>${esc(c)}</th>`;
+  html += '</tr>';
+  for (const row of rows) {
+    html += `<tr><td>${esc(row.table)}</td><td>${esc(row.pk)}</td>`;
+    if (badge) html += `<td><span class="kind-tag kind-${row.kind}">${
+      { insert: '新增', update: '修改', delete: '删除' }[row.kind] || row.kind}</span></td>`;
+    const values = columnsKey === 'before' ? row.before :
+                   columnsKey === 'after' ? row.after :
+                   columnsKey === 'base' ? row.base :
+                   columnsKey === 'revision' ? row.revision : row.current;
+    html += rowCells(cols, values);
+    html += '</tr>';
+  }
+  return html + '</table></details>';
+}
+
+function renderMergeResult(id, job) {
+  let html = '';
+  if (job.merge_ok) {
+    html += '<p class="ok-msg">合并成功：修订变更已应用，当前库补录全部保留，合并库外键有效。</p>';
+  } else {
+    html += `<p class="err">${esc(job.message || '合并失败，未生成合并库。')}</p>`;
+  }
+
+  if (job.row_counts_base) {
+    html += '<table><tr><th>表</th><th>基准库行数</th><th>修订库行数</th>'
+          + '<th>当前库行数</th><th>合并后行数</th></tr>';
+    for (const t of job.tables) {
+      html += `<tr><td>${esc(t)}</td><td>${job.row_counts_base[t] ?? 0}</td>
+               <td>${job.row_counts_revision[t] ?? 0}</td>
+               <td>${job.row_counts_current[t] ?? 0}</td>
+               <td><b>${job.row_counts_merged[t] ?? 0}</b></td></tr>`;
+    }
+    html += '</table>';
+  }
+
+  html += renderRowTable('基准 → 修订 的变更（将应用到当前库）',
+                         job.changes, 'after', true);
+
+  if (job.conflicts && job.conflicts.length) {
+    const cols = job.conflicts[0].columns;
+    html += `<details open><summary class="err">同行冲突（${job.conflicts.length}）</summary>
+      <table class="conflict-row"><tr><th>表</th><th>主键</th><th>冲突原因</th></tr>`;
+    for (const cf of job.conflicts) {
+      html += `<tr><td>${esc(cf.table)}</td><td>${esc(cf.pk)}</td>
+               <td>${esc(cf.reason)}</td></tr>`;
+    }
+    html += '</table>';
+    for (const role of [['base', '基准库该行'], ['revision', '修订库该行'],
+                        ['current', '当前库该行']]) {
+      html += renderRowTable(role[1], job.conflicts, role[0], false);
+    }
+    html += '</details>';
+  }
+
+  if (job.violations && job.violations.length) {
+    html += `<details open><summary class="err">外键失效（${job.violations.length}）</summary>
+      <table class="violation-row"><tr><th>来源表</th><th>来源行主键</th>
+      <th>外键列</th><th>目标表</th><th>缺失的目标主键</th></tr>`;
+    for (const v of job.violations) {
+      html += `<tr><td>${esc(v.table)}</td><td>${esc(v.pk)}</td>
+               <td>${esc(v.column)}</td><td>${esc(v.parent_table)}</td>
+               <td>${esc(v.missing_pk)}</td></tr>`;
+    }
+    html += '</table></details>';
+  }
+
+  if (job.download_available) {
+    html += `<a class="dl" href="/api/merge-jobs/${id}/download">下载合并库 merged.db</a>`;
+  } else {
+    html += '<p class="hint">存在冲突或外键失效，未生成合并库；三个上传文件均保持原样。</p>';
+  }
+  $('merge-detail').innerHTML = html;
+}
 </script>
 </body>
 </html>

@@ -5,6 +5,11 @@
 表结构与剩余行值不变、外键始终有效的前提下删除数据行，直到得到 **1-最小**
 复现库——删除任意一行（连同直接或间接引用它的全部行）后都无法再复现同一错误。
 
+服务同时提供**三方合并**：开发者离线修订“暂存库”期间入仓库又收到补录时，
+上传基准库、修订库、当前库三个结构相同的库，按表和主键把基准→修订的增删改
+只应用到当前库副本，保留当前库的其它补录；同行冲突或合并后外键失效都会明确
+报告且不产出部分结果，成功时下载外键有效的合并库。
+
 ## 复现判定（严格）
 
 * 以 SQLite **扩展错误码 + 完整错误文本** 作为错误指纹，两者完全一致才算复现；
@@ -51,6 +56,36 @@
    直到一整轮没有任何可删集合——即满足 1-最小性；
 3. 产出最终库后再跑一次脚本，确认错误码与完整错误文本与基线一致。
 
+## 三方合并
+
+适用场景：开发者基于**基准库**（共同祖先）离线修订出**修订库**，与此同时
+入仓库（**当前库**）又收到了新的补录。整库覆盖会丢掉补录，因此按行做三方合并。
+
+### 合并语义
+
+* 三个库结构必须完全相同：表集合、列顺序、单列 `INTEGER PRIMARY KEY`、
+  外键定义一致，且各自满足原有约束（至多 3 表共 60 行、单列整数主外键、
+  上传时 `PRAGMA foreign_key_check` 通过），**允许循环外键**；
+* 按 `(表, 主键)` 对齐行，计算**基准 → 修订**的三种变更：
+  新增（INSERT）、删除（DELETE）、修改（UPDATE）；
+* 只把这些变更应用到**当前库的副本**：当前库中与修订无关的补录原样保留；
+* **同行冲突**（任一则拒绝，不产出部分结果）：
+  * 修订与当前都修改同一行且结果互不相同；
+  * 修订修改 / 新增的行在当前库被删除，或修订删除的行在当前库被修改；
+  * 修订与当前都用同一主键新增但行内容不同（内容相同则幂等，不冲突）；
+  * 两边改动落在不同行时互不冲突，各自保留；
+* **最终外键校验**：即使没有同行冲突，应用修订后若某行的外键指向了
+  已不存在的父行（典型：当前库补录引用了修订删除的行），逐条列出
+  来源表、来源行主键、外键列、目标表与缺失主键，并拒绝产出；
+* 应用阶段关闭 `foreign_keys` 以支持循环外键，写盘后重新开启并执行
+  `PRAGMA foreign_key_check` 与 `PRAGMA integrity_check` 双重复核。
+
+### 隔离与原子性
+
+* 三个上传文件落盘后全部设为只读，合并计算全程只接触各自的**规范副本**；
+* 冲突、外键失效或任何处理失败都不会写出 `merged.db`，三个上传文件保持原样；
+* 只有全部检查通过时才生成唯一的合并库供下载。
+
 ## 快速开始（Docker Compose）
 
 ```bash
@@ -58,8 +93,14 @@ docker compose up --build
 # 浏览器打开 http://localhost:8000
 ```
 
-页面支持：上传库与脚本（文件或粘贴文本）、运行、轮询查看删减结果与日志、
-下载复现库 `repro.db`，并内置两个可一键试跑的样例。
+页面支持两个功能区：
+
+* **故障缩减**：上传库与脚本（文件或粘贴文本）、运行、轮询查看删减结果与日志、
+  下载复现库 `repro.db`；
+* **三方合并**：上传基准 / 修订 / 当前三个库，浏览器展示变更明细、同行冲突、
+  外键失效行与各库行数，成功时下载外键有效的合并库 `merged.db`。
+
+两个功能区均内置可一键试跑的样例。
 
 停止与清理：
 
@@ -74,7 +115,7 @@ docker compose down -v       # 同时删除任务数据卷
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
 DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
-.venv/bin/pytest             # 48 个测试
+.venv/bin/pytest             # 69 个测试
 ```
 
 ## 内置样例
@@ -83,6 +124,7 @@ DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
 | --- | --- |
 | `cyclic` | 三表循环外键（dept ↔ employee ↔ project），脚本触发主键唯一约束错误 |
 | `commit_then_fail` | 自引用循环外键，脚本先 `COMMIT` 一个 DELETE，再触发 NOT NULL 错误，验证副本隔离 |
+| `merge_demo` | 三方合并样例：双表循环外键，基准→修订含增/删/改，当前库含独立补录，可一键试跑 |
 
 样例文件由 `app/samples.py` 在启动时生成于 `app/static/`，可单独下载。
 
@@ -102,11 +144,21 @@ DATA_DIR=./data .venv/bin/uvicorn app.main:app --reload --port 8000
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/` | 单页前端 |
-| GET | `/api/samples` | 内置样例清单与下载地址 |
+| GET | `/` | 单页前端（缩减 + 三方合并两个功能区） |
+| GET | `/api/samples` | 内置样例清单与下载地址（含三方合并的三个库） |
 | POST | `/api/jobs` | 表单字段 `db`（必填）、`sql`（文件）或 `script_text`（文本），返回 202 与任务 id |
-| GET | `/api/jobs/{id}` | 查询任务状态、错误指纹、行数变化、保留行与缩减日志 |
+| GET | `/api/jobs/{id}` | 查询任务状态、错误指纹、行数变化、保留行与缩减日志；合并任务也通过此接口轮询 |
 | GET | `/api/jobs/{id}/download` | 下载复现库 `repro.db`（仅缩减成功时可用） |
+| POST | `/api/merge-jobs` | 表单字段 `base_db` / `revision_db` / `current_db` 三个 SQLite 文件，返回 202 与任务 id |
+| GET | `/api/merge-jobs/{id}/download` | 下载合并库 `merged.db`（仅无冲突且外键有效时可用，否则 400） |
+
+合并任务结果（`GET /api/jobs/{id}`，`kind="merge"`）字段：
+
+* `merge_ok`：是否成功；`changes`：基准→修订的增删改明细（含变更前后整行值）；
+* `conflicts`：同行冲突明细（含三库各自的行值与冲突原因）；
+* `violations`：合并后失效的外键引用（来源表/行/列、目标表、缺失主键）；
+* `row_counts_base/revision/current/merged`：各库及合并结果的每表行数；
+* `download_available`：仅成功时为 true。
 
 ## 目录结构
 
@@ -118,12 +170,14 @@ app/
   script_guard.py  # 脚本静态检查
   runner.py        # 规范副本、authorizer、独立副本试跑、确定性双跑
   reducer.py       # ddmin + 逐行闭包终检
-  jobs.py          # 后台任务与并发/TTL 管理
+  merger.py        # 三方合并：行级 diff、冲突检测、合并后外键校验、写盘
+  merge_service.py # 三方合并任务流水线
+  jobs.py          # 后台任务与并发/TTL 管理（缩减与合并共用）
   service.py       # 上传->校验->确认->缩减 流水线
-  samples.py       # 内置样例生成
+  samples.py       # 内置样例生成（缩减样例 + 三方合并样例）
   main.py          # FastAPI 路由
   static/index.html
-tests/             # 48 个单元/集成/端到端测试
+tests/             # 单元/集成/端到端测试（含三方合并 21 个）
 Dockerfile
 docker-compose.yml
 ```

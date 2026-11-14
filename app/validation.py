@@ -18,6 +18,8 @@ from . import config
 from .errors import ValidationError
 
 RowId = tuple[str, int]
+# 一行的完整数据（按表结构列顺序）
+RowValues = tuple[object, ...]
 # 外键边：(来源表, 来源列, 目标表, 目标列)
 FkEdge = tuple[str, str, str, str]
 
